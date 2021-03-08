@@ -148,9 +148,9 @@ object NatFlow {
       }
     }).filter(_.username != "UnKnown")
 
-//    // TODO 1.1 用户统计
-//    HbaseStream.map(per => (per.username, per.accesstime))
-//      .addSink(new UsernameHDFSSink)
+    // TODO 1.1 用户统计
+    HbaseStream.map(per => (per.username, per.accesstime))
+      .addSink(new UsernameHDFSSink)
 
     // TODO 1.2 日志计数
     HbaseStream.map(per => (per.accesstime, 1))
@@ -168,36 +168,36 @@ object NatFlow {
         }
       })
 
-//    // TODO 1.3 ES实现二级索引
-//    val esSink: ElasticsearchSink.Builder[util.HashMap[String, String]] = new ElasticsearchSink.Builder[util.HashMap[String, String]](httpHosts, new ElasticsearchSinkFunction[util.HashMap[String, String]] {
-//      override def process(t: util.HashMap[String, String], runtimeContext: RuntimeContext, requestIndexer: RequestIndexer): Unit = {
-//        def createRequest(element: util.HashMap[String, String]): IndexRequest = {
-//          Requests.indexRequest(s"bigdata_nat_hbase_test_0").`type`("hbase").id(element.get("rowkey"))
-//            .source(element)
-//        }
-//
-//        requestIndexer.add(createRequest(t))
-//      }
-//    })
-//    esSink.setBulkFlushMaxActions(1)
-//    HbaseStream.map(per => {
-//      val json = new java.util.HashMap[String, String]
-//      json.put("sourceIp", per.sourceIp)
-//      json.put("sourcePort", per.sourcePort)
-//      json.put("targetIp", per.targetIp)
-//      json.put("targetPort", per.targetPort)
-//      json.put("convertedIp", per.convertedIp)
-//      json.put("convertedPort", per.convertedPort)
-//      json.put("accesstime", per.accesstime.toString)
-//      json.put("rowkey", per.rowkey)
-//      json
-//    }).addSink(esSink.build())
-//
-//    // TODO 1.4 日志记录sink到Hbase
-//    HbaseStream.addSink(new HBaseWrite)
-//
-//    // TODO 2 日志分析流
-//    NATAnalyze(baseStream)
+    // TODO 1.3 ES实现二级索引
+    val esSink: ElasticsearchSink.Builder[util.HashMap[String, String]] = new ElasticsearchSink.Builder[util.HashMap[String, String]](httpHosts, new ElasticsearchSinkFunction[util.HashMap[String, String]] {
+      override def process(t: util.HashMap[String, String], runtimeContext: RuntimeContext, requestIndexer: RequestIndexer): Unit = {
+        def createRequest(element: util.HashMap[String, String]): IndexRequest = {
+          Requests.indexRequest(s"bigdata_nat_hbase_test_0").`type`("hbase").id(element.get("rowkey"))
+            .source(element)
+        }
+
+        requestIndexer.add(createRequest(t))
+      }
+    })
+    esSink.setBulkFlushMaxActions(1)
+    HbaseStream.map(per => {
+      val json = new java.util.HashMap[String, String]
+      json.put("sourceIp", per.sourceIp)
+      json.put("sourcePort", per.sourcePort)
+      json.put("targetIp", per.targetIp)
+      json.put("targetPort", per.targetPort)
+      json.put("convertedIp", per.convertedIp)
+      json.put("convertedPort", per.convertedPort)
+      json.put("accesstime", per.accesstime.toString)
+      json.put("rowkey", per.rowkey)
+      json
+    }).addSink(esSink.build())
+
+    // TODO 1.4 日志记录sink到Hbase
+    HbaseStream.addSink(new HBaseWrite)
+
+    // TODO 2 日志分析流
+    NATAnalyze(baseStream)
 
     // 运行环境执行
     env.execute("NATFlow")
