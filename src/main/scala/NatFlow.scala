@@ -9,8 +9,6 @@ import org.apache.flink.api.java.tuple.Tuple
 import org.apache.flink.api.scala._
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.streaming.api.TimeCharacteristic
-import org.apache.flink.streaming.api.datastream.DataStreamSink
-import org.apache.flink.streaming.api.functions.ProcessFunction
 import org.apache.flink.streaming.api.functions.sink.{RichSinkFunction, SinkFunction}
 import org.apache.flink.streaming.api.functions.timestamps.BoundedOutOfOrdernessTimestampExtractor
 import org.apache.flink.streaming.api.scala.function.ProcessWindowFunction
@@ -45,8 +43,10 @@ object NatFlow {
 
   def main(args: Array[String]): Unit = {
 
-    val env = StreamExecutionEnvironment.createLocalEnvironmentWithWebUI()
-    env.setParallelism(6)
+    val env = StreamExecutionEnvironment
+      .getExecutionEnvironment
+    //      .createLocalEnvironmentWithWebUI()
+
     env.enableCheckpointing(5000)
     env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime)
 
@@ -54,14 +54,14 @@ object NatFlow {
     props.setProperty("bootstrap.servers", "30.250.11.139:9092,30.250.11.140:9092,30.250.11.141:9092")
     props.setProperty("enable.auto.commit", "true")
     props.setProperty("auto.commit.interval.ms", "1000")
-    props.setProperty("max.partition.fetch.bytes", "24") // 设置分区消费消息最大大小
+    props.setProperty("max.partition.fetch.bytes", "40960") // 设置分区消费消息最大大小
     props.setProperty("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer")
     props.setProperty("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer")
 
     val url1 = "jdbc:mysql://30.250.11.142:3306/broadband?characterEncoding=utf-8&useSSL=false"
     val url2 = "jdbc:mysql://30.250.11.142:3306/nat_log?characterEncoding=utf-8&useSSL=false"
-    val userName1 = "admin"
-    val password1 = "SX_enable!@#123"
+    val userName = "admin"
+    val password = "SX_enable!@#123"
 
     //注册Driver
     Class.forName("com.mysql.jdbc.Driver")
@@ -114,11 +114,12 @@ object NatFlow {
     ).keyBy(_.accesstime)
       .timeWindow(Time.seconds(300))
 
+    // TODO 1 日志记录流
     // TODO 数据源日志计数
     LogStream.process(new ProcessWindowFunction[NATLog, (Long, Int), Long, TimeWindow] {
       override def process(key: Long, context: Context, elements: Iterable[NATLog], out: Collector[(Long, Int)]): Unit = {
         val count = elements.size
-        val count_connection = DriverManager.getConnection(url2, userName1, password1)
+        val count_connection = DriverManager.getConnection(url2, userName, password)
         val statement = count_connection.createStatement
         statement.executeUpdate(s"insert into nat_count (count_5min,count_sec,update_time) values ('$count','${count / 300}','${new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(key)}')")
         count_connection.close()
@@ -126,10 +127,9 @@ object NatFlow {
       }
     })
 
-    // TODO 1 日志记录流
     val HbaseStream = LogStream.process(new ProcessWindowFunction[NATLog, NATBean, Long, TimeWindow] {
       override def process(key: Long, context: Context, elements: Iterable[NATLog], out: Collector[NATBean]): Unit = {
-        val username_connection = DriverManager.getConnection(url1, userName1, password1)
+        val username_connection = DriverManager.getConnection(url1, userName, password)
         val statement1 = username_connection.createStatement
 
         var usernames = Map[String, String]()
@@ -149,8 +149,8 @@ object NatFlow {
     }).filter(_.username != "UnKnown")
 
     // TODO 1.1 用户统计
-    HbaseStream.map(per => (per.username, per.accesstime))
-      .addSink(new UsernameHDFSSink)
+    HbaseStream.map(per => (per.username, 1L, per.accesstime, "username"))
+      .addSink(new HDFSSink)
 
     // TODO 1.2 日志计数
     HbaseStream.map(per => (per.accesstime, 1))
@@ -159,7 +159,7 @@ object NatFlow {
       .process(new ProcessWindowFunction[(Long, Int), (Long, Int), Tuple, TimeWindow] {
         override def process(key: Tuple, context: Context, elements: Iterable[(Long, Int)], out: Collector[(Long, Int)]): Unit = {
           val count = elements.size
-          val count_connection = DriverManager.getConnection(url2, userName1, password1)
+          val count_connection = DriverManager.getConnection(url2, userName, password)
           val statement = count_connection.createStatement
           val start = context.window.getStart
           statement.executeUpdate(s"insert into nat_hbase_count (count_5min,count_sec,update_time) values ('$count','${count / 300}','${new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(start)}')")
@@ -169,7 +169,7 @@ object NatFlow {
       })
 
     // TODO 1.3 ES实现二级索引
-    val esSink: ElasticsearchSink.Builder[util.HashMap[String, String]] = new ElasticsearchSink.Builder[util.HashMap[String, String]](httpHosts, new ElasticsearchSinkFunction[util.HashMap[String, String]] {
+    val esSink1: ElasticsearchSink.Builder[util.HashMap[String, String]] = new ElasticsearchSink.Builder[util.HashMap[String, String]](httpHosts, new ElasticsearchSinkFunction[util.HashMap[String, String]] {
       override def process(t: util.HashMap[String, String], runtimeContext: RuntimeContext, requestIndexer: RequestIndexer): Unit = {
         def createRequest(element: util.HashMap[String, String]): IndexRequest = {
           Requests.indexRequest(s"bigdata_nat_hbase_test_0").`type`("hbase").id(element.get("rowkey"))
@@ -179,7 +179,7 @@ object NatFlow {
         requestIndexer.add(createRequest(t))
       }
     })
-    esSink.setBulkFlushMaxActions(1)
+    esSink1.setBulkFlushMaxActions(1)
     HbaseStream.map(per => {
       val json = new java.util.HashMap[String, String]
       json.put("sourceIp", per.sourceIp)
@@ -191,21 +191,12 @@ object NatFlow {
       json.put("accesstime", per.accesstime.toString)
       json.put("rowkey", per.rowkey)
       json
-    }).addSink(esSink.build())
+    }).addSink(esSink1.build())
 
     // TODO 1.4 日志记录sink到Hbase
     HbaseStream.addSink(new HBaseWrite)
 
     // TODO 2 日志分析流
-    NATAnalyze(baseStream)
-
-    // 运行环境执行
-    env.execute("NATFlow")
-
-  }
-
-  // 日志分析(ip分析写入hdfs未完成)
-  def NATAnalyze(baseStream: DataStream[NATLog]): DataStreamSink[util.HashMap[String, String]] = {
     val analyzeStream: DataStream[NATAnalyze] = baseStream.map(per => {
       // 获取运营商
       var operator = "UnKnown"
@@ -257,11 +248,6 @@ object NatFlow {
       .map(per => {
         tuple2Json(per, "province")
       })
-        .process(new ProcessFunction(){
-          override def processElement(value: util.HashMap[String, String], ctx: ProcessFunction[util.HashMap[String, String], util.HashMap[String, String]]#Context, out: Collector[util.HashMap[String, String]]): Unit = {
-
-          }
-        })
 
     province.addSink(esSink.build())
 
@@ -276,11 +262,16 @@ object NatFlow {
 
     operator.addSink(esSink.build())
 
-    // TODO 2.3 目标IP维度聚合(sink hdfs 未完成)
-    //        analyzeStream.map(per => {
-    //          ((per.accesstime, per.targetIp), 1)
-    //        }).keyBy(0).sum(1)
-    //          .filter(_._2 > 10).map(per => (per._1._1, per._1._2, per._2))
+    // TODO 2.3 目标IP维度聚合
+    val targetIp: DataStream[(String, Long, Long, String)] = analyzeStream.map(per => {
+      (per.targetIp, 1)
+    })
+      .keyBy(0)
+      .timeWindow(Time.seconds(300))
+      .process(new MyProcessWindowFunction)
+      .map(per => (per._1, per._2, per._3, "targetIp"))
+
+    targetIp.addSink(new HDFSSink)
 
     // TODO 2.4 省会维度聚合
     val city: DataStream[util.HashMap[String, String]] = analyzeStream.map(per => (per.city, 1))
@@ -293,50 +284,10 @@ object NatFlow {
       })
 
     city.addSink(esSink.build())
-  }
 
-  // 自定义HDFS Sink
-  class UsernameHDFSSink extends RichSinkFunction[(String, Long)] {
-    var conf: org.apache.hadoop.conf.Configuration = _
-    var fs: FileSystem = _
-    val df = new SimpleDateFormat("yyyyMMddHHmm")
+    // 运行环境执行
+    env.execute("NATFlow")
 
-    override def open(parameters: Configuration): Unit = {
-      conf = new org.apache.hadoop.conf.Configuration()
-      conf.set("fs.defaultFS", "hdfs://nns")
-      conf.set("dfs.nameservices", "nns")
-      conf.set("dfs.ha.namenodes.nns", "nn1,nn2")
-      conf.set("dfs.namenode.rpc-address.nns.nn1", "30.250.60.2:8020")
-      conf.set("dfs.namenode.rpc-address.nns.nn2", "30.250.60.7:8020")
-      conf.set("dfs.client.failover.proxy.provider.nns", "org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider")
-      conf.setBoolean("dfs.support.append", true)
-
-      fs = FileSystem.get(conf)
-    }
-
-    override def invoke(value: (String, Long), context: SinkFunction.Context[_]): Unit = {
-      val date = df.format(value._2)
-      val path = new Path(s"hdfs://nns/nat_test/username/${date.substring(0, 8)}/username.txt")
-      if (!fs.exists(path)) {
-        fs.createNewFile(path)
-      }
-      val append = fs.append(path)
-      append.write(value.toString().getBytes("UTF-8"))
-      append.write(10)
-      append.flush()
-      append.close()
-    }
-
-    override def close(): Unit = {
-      if (fs != null) {
-        try {
-          fs.close()
-        } catch {
-          case e: Exception =>
-            e.printStackTrace()
-        }
-      }
-    }
   }
 
   // 元组转json
@@ -346,7 +297,7 @@ object NatFlow {
     json.put("data", per._1)
     json.put("count", per._2.toString)
     json.put("accesstime", per._3.toString)
-//    json.put("username",per.toString())
+    //    json.put("username",per.toString())
     json
   }
 
@@ -414,6 +365,52 @@ object NatFlow {
       }
       val time = context.window.getStart / 1000
       out.collect((key.getField(0), sum, time))
+    }
+  }
+
+  // 自定义HDFS Sink
+  class HDFSSink extends RichSinkFunction[(String, Long, Long, String)] {
+    var conf: org.apache.hadoop.conf.Configuration = _
+    var fs: FileSystem = _
+    val df = new SimpleDateFormat("yyyyMMddHHmm")
+
+    override def open(parameters: Configuration): Unit = {
+      conf = new org.apache.hadoop.conf.Configuration()
+      conf.set("fs.defaultFS", "hdfs://nns")
+      conf.set("dfs.nameservices", "nns")
+      conf.set("dfs.ha.namenodes.nns", "nn1,nn2")
+      conf.set("dfs.namenode.rpc-address.nns.nn1", "30.250.60.2:8020")
+      conf.set("dfs.namenode.rpc-address.nns.nn2", "30.250.60.7:8020")
+      conf.set("dfs.client.failover.proxy.provider.nns", "org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider")
+      conf.setBoolean("dfs.support.append", true)
+      conf.setBoolean("mapreduce.app-submission.cross-platform", true) //设置跨平台提交
+      conf.set("fs.hdfs.impl", "org.apache.hadoop.hdfs.DistributedFileSystem") //设置使用hdfs分布式文件系统
+
+      fs = FileSystem.get(conf)
+    }
+
+    override def invoke(value: (String, Long, Long, String), context: SinkFunction.Context[_]): Unit = {
+      val date = df.format(value._3 * 1000)
+      val path = new Path(s"hdfs://nns/nat_test/${value._4}/${date.substring(0, 8)}/${value._4}.txt")
+      if (!fs.exists(path)) {
+        fs.createNewFile(path)
+      }
+      val append = fs.append(path)
+      append.write((value._1, value._2, value._3).toString().getBytes("UTF-8"))
+      append.write(10)
+      append.flush()
+      append.close()
+    }
+
+    override def close(): Unit = {
+      if (fs != null) {
+        try {
+          fs.close()
+        } catch {
+          case e: Exception =>
+            e.printStackTrace()
+        }
+      }
     }
   }
 
