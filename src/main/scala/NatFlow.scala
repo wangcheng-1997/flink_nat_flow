@@ -45,7 +45,6 @@ object NatFlow {
 
     val env = StreamExecutionEnvironment
       .getExecutionEnvironment
-    //      .createLocalEnvironmentWithWebUI()
 
     env.enableCheckpointing(5000)
     env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime)
